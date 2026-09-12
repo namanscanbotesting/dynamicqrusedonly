@@ -1,0 +1,16 @@
+# Examples 1:
+# Project with only source/config files
+# Expected: Empty output
+
+# Example 2:
+# Project with artifacts
+# Expected: Comprehensive .gitignore with all relevant patterns
+
+# Actual input: Only markdown file added
+# Result: No ignores needed
+
+# SECURE_QR_OTP_IMPLEMENTATION_PLAN.md is a source document, not an artifact
+# No build artifacts, dependencies, or temp files detected in changes
+# Therefore, no .gitignore rules are needed
+
+# Output: (nothing)
