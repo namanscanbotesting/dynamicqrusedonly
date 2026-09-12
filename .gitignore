@@ -1,0 +1,5 @@
+```gitignore
+# No build artifacts, dependencies, or temporary files detected in changes
+# Only README.md was modified, which is a source/config file
+# Therefore, no additional ignore rules are needed
+```
