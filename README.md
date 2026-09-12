@@ -1,98 +1,173 @@
 # 🔐 Quantum-Secure Patient Profile Architecture
-## "OTP-Locked QR" System
+## "Delayed OTP-Locked QR" System
 
-This document details the secure flow for generating patient profiles where the **Private Key Seed** is **never stored in plain text** on the server. The system uses a **Zero-Knowledge** approach where:
-- **Server** stores only the encrypted blob (locked box)
-- **Patient** receives the OTP key via SMS (the key)
-- **QR Code** provides the request_id (pointer to the box)
+This document details the secure flow for generating patient profiles where the **Private Key Seed** is **never stored in plain text** on the server. The system uses a **Zero-Knowledge** approach with **Delayed Claiming**:
 
-Access requires **both** the QR Code (something you have) **and** the Time-Sensitive OTP sent to the registered mobile (something you have).
+- **Server** stores only the encrypted blob (locked box) + wrapped recovery key
+- **Patient** receives OTP via SMS **ONLY when claiming** (not at registration)
+- **QR Code** provides the `request_id` (pointer to the box)
+- **Doctor** generates everything at registration, then wipes memory immediately
+
+Access requires **both** the QR Code (something you have) **and** the Time-Sensitive OTP sent to the registered mobile **when patient actively claims** their profile.
+
+### ⏱️ Key Feature: Delayed Claiming
+- **Registration (Day 0)**: Doctor creates profile → NO OTP sent → Patient not present
+- **Claiming (Day 3+)**: Patient scans QR + enters phone → OTP sent NOW → Patient unlocks seed
 
 ---
 
 ## 🚀 Core Security Principles
 
-1.  **Zero-Knowledge Server**: Server stores only `EncryptedBlob`, `Salt`, `PhoneHash`. Never sees raw OTP or Private Key Seed.
-2.  **OTP-Derived Encryption**: Encryption key is derived from OTP using PBKDF2 (100k iterations). No separate key storage needed.
-3.  **Quantum Resistance**: Patient's `seed_hex` generated using Quantum SDK's CSPRNG, protected by AES-256-GCM.
-4.  **Brute-Force Protection**: 100,000 PBKDF2 iterations + rate limiting (5 attempts/hour) + 5-minute OTP expiry.
-5.  **Elegant Simplicity**: No HSM/KMS required. The OTP **is** the key derivation secret.
+1.  **Zero-Knowledge Server**: Server stores only `EncryptedPayload`, `WrappedRecoveryKey`, `PhoneHash`. Never sees raw `seed_hex`, OTP, or recovery key.
+2.  **Two-Layer Encryption**: 
+    - Layer 1: `seed_hex` encrypted with random `recovery_key` (AES-256-GCM)
+    - Layer 2: `recovery_key` encrypted with OTP-derived key (PBKDF2 + AES-256-GCM)
+3.  **Delayed OTP Trigger**: OTP generated and sent **ONLY** when patient enters phone number during claiming (not at registration)
+4.  **Quantum Resistance**: Patient's `seed_hex` generated using Quantum SDK's CSPRNG (`generate_seed()`), protected by AES-256-GCM.
+5.  **Brute-Force Protection**: 100,000 PBKDF2 iterations + rate limiting (5 attempts/hour) + 5-minute OTP expiry.
 
 ---
 
 ## 🔄 The Workflow
 
-### Phase 1: Doctor Registers Patient (Creation)
-*No OTP sent yet. Patient is not present. Doctor's device holds secrets temporarily in RAM only.*
+### Phase 1: Doctor Registration (Day 0 - Patient NOT Present)
+***NO OTP SENT YET*** - Doctor creates profile and hands QR to patient. Patient can claim days/weeks later.
 
-1.  **Generate Seed**: Doctor's app uses Quantum SDK to generate `seed_hex` (Private Key)
+1.  **Generate Seed**: Doctor's app uses Quantum SDK `generate_seed()` to create patient's private key
     ```javascript
-    const { seed_hex } = await generate_seed();
-    // seed_hex exists only in RAM temporarily
+    import { generate_seed } from "@dignera/quantum-sdk";
+    
+    const { seed_hex } = generate_seed();
+    // seed_hex exists only in RAM - will be wiped after encryption
     ```
 
-2.  **Create OTP**: System generates random 6-digit OTP (e.g., `849201`)
-
-3.  **Derive Encryption Key**: Run OTP through PBKDF2
+2.  **Generate Recovery Key**: Create random 256-bit recovery key (not OTP yet!)
     ```javascript
-    const encryptionKey = await pbkdf2(OTP, salt, iterations=100000);
-    // Key = PBKDF2(OTP, Salt, Iterations=100,000)
+    const recoveryKey = crypto.getRandomValues(new Uint8Array(32));
+    // This is a random key, NOT derived from OTP
     ```
 
-4.  **Encrypt the Seed**: AES-256-GCM encryption
+3.  **Layer 1 Encryption**: Encrypt `seed_hex` with `recovery_key`
     ```javascript
-    const EncryptedBlob = await aes256GcmEncrypt(seed_hex, encryptionKey);
-    // EncryptedBlob = AES-256-GCM(seed_hex, Key)
+    const encryptedPayload = await aes256GcmEncrypt(seed_hex, recoveryKey);
+    // encryptedPayload = AES-256-GCM(seed_hex, recoveryKey)
     ```
 
-5.  **Store Data**:
-    - **Database**: Stores `{ EncryptedBlob, PhoneHash, Salt, AttemptCount, request_id }`
-    - **QR Code**: Contains only `request_id` (pointer to database record)
-    - **SMS**: Sends plain OTP (`849201`) to patient's phone
+4.  **Generate OTP Secret**: Create random OTP that will be used later during claiming
+    ```javascript
+    const otpSecret = crypto.getRandomValues(new Uint8Array(32));
+    // This will be used to derive OTP key when patient claims
+    ```
 
-6.  **Wipe Memory**: Doctor's app immediately deletes:
+5.  **Layer 2 Encryption**: Encrypt `recovery_key` with `otp_secret`
+    ```javascript
+    const wrappedRecoveryKey = await aes256GcmEncrypt(recoveryKey, otpSecret);
+    // wrappedRecoveryKey = AES-256-GCM(recoveryKey, otpSecret)
+    ```
+
+6.  **Store Data**:
+    - **Database**: Stores `{ request_id, phone_hash, encryptedPayload, wrappedRecoveryKey, otpSecretHash, salt }`
+      - `encryptedPayload`: Layer 1 encrypted seed
+      - `wrappedRecoveryKey`: Layer 2 encrypted recovery key
+      - `otpSecretHash`: SHA-256 hash of `otpSecret` (for verification later)
+      - `phone_hash`: SHA-256(patient_phone + global_salt)
+    - **QR Code**: Contains only `request_id` (UUID pointer to database record)
+    - **NO SMS SENT YET** - OTP generation happens only during claiming
+
+7.  **Wipe Memory**: Doctor's app immediately zeroizes:
     - Raw `seed_hex`
-    - Plain OTP
-    - Derived `encryptionKey`
+    - `recoveryKey`
+    - `otpSecret`
+    - All intermediate encryption keys
 
-7.  **Result**: 
-    - ✅ Server has the **locked box** (EncryptedBlob)
-    - ✅ Patient has the **key** (OTP) in their SMS
+8.  **Result**: 
+    - ✅ Server has **double-locked box** (`encryptedPayload` + `wrappedRecoveryKey`)
     - ✅ Doctor has **nothing** (memory wiped)
+    - ⏳ Patient has **QR code** but NO OTP yet (will receive when claiming)
 
-### Phase 2: Patient Scans & Unlocks (Retrieval)
-*OTP verification happens during decryption attempt.*
+---
 
-1.  **Scan QR**: Patient scans QR → App gets `request_id`
+### Phase 2: Patient Claiming (Day 3+ - When Patient Logs In)
+***OTP TRIGGERED HERE*** - Patient actively claims their profile.
 
-2.  **Enter Phone**: Patient enters phone number → Server verifies hash matches stored `PhoneHash`
+1.  **Install App & Scan QR**: Patient installs app, scans QR → App gets `request_id`
 
-3.  **Enter OTP**: Patient types the OTP from their SMS (`849201`)
-
-4.  **Derive Key on Client**: Patient's app runs same PBKDF2 derivation
+2.  **Enter Phone Number**: Patient enters registered phone number
     ```javascript
-    const encryptionKey = await pbkdf2(userInputOTP, salt, iterations=100000);
+    const phoneHash = sha256(phoneNumber + globalSalt);
     ```
 
-5.  **Fetch & Decrypt**:
+3.  **Server Validation**:
+    - Hash entered phone → matches stored `phone_hash`?
+    - Check rate limit: < 5 attempts in last hour?
+    - **TRIGGER OTP**: Generate 6-digit OTP, send SMS NOW
+      ```javascript
+      // Server-side OTP generation
+      const otp = generate6DigitOTP(); // e.g., "849201"
+      const otpHash = sha256(otp);
+      
+      // Store OTP hash with 5-minute expiry
+      await redis.setex(`otp:${request_id}`, 300, otpHash);
+      
+      // Send SMS via Twilio/AWS SNS
+      await smsProvider.send(phoneNumber, `Your OTP: ${otp}`);
+      ```
+
+4.  **Patient Enters OTP**: User types OTP from SMS into app
+
+5.  **Derive OTP Key**: Patient's app derives encryption key from OTP
     ```javascript
-    const EncryptedBlob = await fetchFromServer(request_id);
-    const seed_hex = await aes256GcmDecrypt(EncryptedBlob, encryptionKey);
+    const otpKey = await pbkdf2(userInputOTP, salt, iterations=100000);
     ```
 
-6.  **Success/Fail**:
-    - ✅ **Correct OTP**: Decryption succeeds → App now has `seed_hex`
-      - Save to device secure storage (iOS Keychain / Android Keystore)
-      - Import into Quantum SDK: `start_session({ did, seed_hex })`
-    - ❌ **Wrong OTP**: Decryption fails (auth tag mismatch / garbage output) → Access denied
-
-7.  **Optional Server Verification** (Recommended for rate limiting):
+6.  **Fetch Encrypted Data**: App downloads from server
     ```javascript
-    // Server checks OTP hash before allowing decrypt attempt
-    // Prevents brute force by tracking failed attempts per request_id
-    const isValid = await verifyOtpHash(request_id, userInputOTP);
-    if (!isValid) throw new Error('Invalid OTP');
+    const { encryptedPayload, wrappedRecoveryKey, salt } = await fetch(`/api/recovery/${request_id}`);
     ```
+
+7.  **Decrypt Layer 2**: Unwrap `recovery_key` using OTP-derived key
+    ```javascript
+    try {
+      const recoveryKey = await aes256GcmDecrypt(wrappedRecoveryKey, otpKey);
+      // If OTP wrong: throws auth tag mismatch error
+    } catch (e) {
+      // Wrong OTP - increment attempt counter
+      await server.incrementAttemptCount(request_id);
+      throw new Error('Invalid OTP');
+    }
+    ```
+
+8.  **Decrypt Layer 1**: Unlock `seed_hex` using recovered `recovery_key`
+    ```javascript
+    const seed_hex = await aes256GcmDecrypt(encryptedPayload, recoveryKey);
+    // Success! Patient now has their private key seed
+    ```
+
+9.  **Import into Quantum SDK**:
+    ```javascript
+    import { start_session } from "@dignera/quantum-sdk";
+    
+    const session = await start_session({
+      did: patientDID, // Optional if using DID
+      seed_hex: seed_hex
+    });
+    ```
+
+10. **Save to Secure Storage**:
+    - SDK automatically saves to device secure enclave (Keychain/Keystore/IndexedDB)
+    - Session valid for 1 hour, then re-authenticate with biometrics/passcode
+
+11. **Zeroize Memory**:
+    ```javascript
+    zeroize(recoveryKey);
+    zeroize(seed_hex);
+    zeroize(otpKey);
+    ```
+
+12. **Result**:
+    - ✅ Patient has `seed_hex` saved securely in device
+    - ✅ Quantum SDK session active
+    - ✅ Server never saw raw `seed_hex`, `recoveryKey`, or plain OTP
 
 ---
 
@@ -100,34 +175,36 @@ Access requires **both** the QR Code (something you have) **and** the Time-Sensi
 
 | Threat Scenario | What They Get | Can they get Private Key? | Why? |
 | :--- | :--- | :--- | :--- |
-| **Database Theft** | `EncryptedBlob`, `Salt`, `PhoneHash` | ❌ **NO** | Don't have OTP. Brute-forcing 6-digit OTP with 100k PBKDF2 iterations takes years per attempt. |
-| **QR Code Theft** | `request_id` | ❌ **NO** | It's just an ID. Without phone number + OTP, it's useless. |
-| **SMS Interception** | OTP (`849201`) | ❌ **NO** | Have the key, but don't have `EncryptedBlob` (needs DB access) or `request_id` (needs QR). |
-| **Server Compromise** | Running code, DB access | ❌ **NO** | Server never holds OTP or decrypted seed. Zero-knowledge architecture. |
-| **Brute Force OTP** | Infinite attempts | ❌ **NO** | Rate limited (5 attempts/hour). OTP expires in 5 mins. 100k PBKDF2 iterations slow each attempt. |
-| **Doctor Device Forensics** | Memory dump after registration | ❌ **NO** | `seed_hex`, OTP, and `encryptionKey` wiped from RAM immediately after encryption. |
+| **Database Theft** | `encryptedPayload`, `wrappedRecoveryKey`, `phone_hash`, `salt` | ❌ **NO** | Two-layer encryption: Need OTP to unwrap `recovery_key`, then need `recovery_key` to decrypt `seed_hex`. Brute-forcing 6-digit OTP with 100k PBKDF2 iterations takes years per attempt. |
+| **Stolen QR Code** | `request_id` | ❌ **NO** | Just an ID pointer. Needs registered phone number + OTP to trigger decryption flow. |
+| **SMS Interception** | OTP (`849201`) | ❌ **NO** | Have the key, but don't have `wrappedRecoveryKey` (needs DB access) or `request_id` (needs QR). Also needs phone hash verification. |
+| **Server Compromise** | Running code, DB access | ❌ **NO** | Server never holds raw `seed_hex`, `recoveryKey`, or plain OTP. Zero-knowledge architecture with client-side decryption. |
+| **Brute Force OTP** | Infinite attempts | ❌ **NO** | Rate limited (5 attempts/hour per `request_id`). OTP expires in 5 mins. 100k PBKDF2 iterations make each attempt ~100ms. |
+| **Doctor Device Forensics** | Memory dump after registration | ❌ **NO** | `seed_hex`, `recoveryKey`, `otpSecret` all zeroized from RAM immediately after encryption. |
+| **SIM Swap Attack** | Receives patient's SMS | ⚠️ **PARTIAL** | Would receive OTP, but still needs QR code + patient's device. *Mitigation*: Add device fingerprinting during claiming phase. |
+| **Delayed Claim Exploit** | Access to unclaimed profile | ❌ **NO** | Profile remains encrypted indefinitely. OTP only generated when patient actively claims with correct phone number. |
 
 ---
 
 ## 🧩 SDK Integration Points (Using Existing Quantum SDK)
 
-The architecture leverages your existing Quantum SDK across all platforms. Here's how to integrate:
+The architecture leverages your existing Quantum SDK across all platforms. Here's how to integrate the **Delayed OTP-Locked QR** system:
 
-### 1. Generate Patient Seed (Doctor App - Phase 1)
+### 1. Generate Patient Seed (Doctor App - Phase 1, Step 1)
 
 **All Platforms**: Use `generate_seed()` to create the patient's private key seed.
 
 ```javascript
-// JavaScript/TypeScript (Web/Node.js)
+// JavaScript/TypeScript (Web/Node.js - Doctor App)
 import { generate_seed } from "@dignera/quantum-sdk";
 
 const { seed_hex } = generate_seed();
 // seed_hex is 64-byte hex string (256-bit entropy)
-// Exists only in RAM - will be wiped after encryption
+// Exists only in RAM - will be wiped after Layer 1 encryption
 ```
 
 ```python
-# Python (Backend/Scripts)
+# Python (Backend/Scripts - Doctor App)
 from quantum_sdk import generate_seed
 
 seed_hex = generate_seed().seed_hex
@@ -135,7 +212,7 @@ seed_hex = generate_seed().seed_hex
 ```
 
 ```rust
-// Rust (Native services)
+// Rust (Native services - Doctor App)
 use quantum_sdk::generate_seed;
 
 let seed = generate_seed()?;
@@ -143,15 +220,15 @@ let seed_hex = seed.seed_hex;
 ```
 
 ```swift
-// iOS (Swift)
+// iOS (Swift - Doctor App)
 import QuantumSDK
 
 let seedHex = try generateSeed().seedHex
-// Temporary - wipe after encrypting
+// Temporary - wipe after Layer 1 encryption
 ```
 
 ```kotlin
-// Android (Kotlin)
+// Android (Kotlin - Doctor App)
 import uniffi.quantum_sdk_mobile.*
 
 val seedHex = withContext(Dispatchers.IO) { 
@@ -161,20 +238,119 @@ val seedHex = withContext(Dispatchers.IO) {
 
 ---
 
-### 2. Derive DID (Optional - If using DID-based identity)
+### 2. Generate Random Recovery Key (Doctor App - Phase 1, Step 2)
 
 ```javascript
-// Doctor App - Create DID document for patient
-import { derive_did } from "@dignera/quantum-sdk";
+// Web/Node.js - Generate 256-bit random recovery key
+const recoveryKey = crypto.getRandomValues(new Uint8Array(32));
+// This is a random key, NOT derived from OTP
+// Will be used for Layer 1 encryption
+```
 
-const derived = await derive_did(seed_hex, keypair_index=0);
-// Returns: { did, auth_public_key, key_agreement_public_key, encrypted_identity }
-// encrypted_identity can be stored server-side for future recovery
+```python
+# Python - Generate 256-bit random recovery key
+import os
+recovery_key = os.urandom(32)  # 32 bytes = 256 bits
 ```
 
 ---
 
-### 3. PBKDF2 Key Derivation (Both Phases)
+### 3. Layer 1 Encryption: Encrypt Seed with Recovery Key (Doctor App - Phase 1, Step 3)
+
+```javascript
+// Web/Node.js - AES-256-GCM encryption
+async function encryptLayer1(seedHex, recoveryKey) {
+  const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV
+  
+  const encoder = new TextEncoder();
+  const seedBytes = encoder.encode(seedHex);
+  
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv },
+    recoveryKey,
+    seedBytes
+  );
+  
+  return {
+    encryptedPayload: new Uint8Array(ciphertext),
+    iv: iv
+  };
+}
+
+// Usage
+const { encryptedPayload, iv: layer1Iv } = await encryptLayer1(seed_hex, recoveryKey);
+```
+
+```python
+# Python - AES-256-GCM encryption
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+def encrypt_layer1(seed_hex: str, recovery_key: bytes) -> dict:
+    aesgcm = AESGCM(recovery_key)
+    iv = os.urandom(12)  # 96-bit IV
+    
+    ciphertext = aesgcm.encrypt(iv, seed_hex.encode(), None)
+    
+    return {
+        'encrypted_payload': ciphertext,
+        'layer1_iv': iv
+    }
+```
+
+---
+
+### 4. Generate OTP Secret (Doctor App - Phase 1, Step 4)
+
+```javascript
+// Web/Node.js - Generate random OTP secret (used later during claiming)
+const otpSecret = crypto.getRandomValues(new Uint8Array(32));
+// This will be wrapped with OTP-derived key when patient claims
+// NOT sent via SMS yet - OTP generated only during claiming phase
+```
+
+```python
+# Python - Generate random OTP secret
+otp_secret = os.urandom(32)  # 32 bytes = 256 bits
+```
+
+---
+
+### 5. Layer 2 Encryption: Wrap Recovery Key with OTP Secret (Doctor App - Phase 1, Step 5)
+
+```javascript
+// Web/Node.js - AES-256-GCM encryption
+async function encryptLayer2(recoveryKey, otpSecret) {
+  const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV
+  
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv },
+    otpSecret,
+    recoveryKey
+  );
+  
+  return {
+    wrappedRecoveryKey: new Uint8Array(ciphertext),
+    iv: iv
+  };
+}
+
+// Usage
+const { wrappedRecoveryKey, iv: layer2Iv } = await encryptLayer2(recoveryKey, otpSecret);
+```
+
+```python
+# Python - AES-256-GCM encryption
+def encrypt_layer2(recovery_key: bytes, otp_secret: bytes) -> dict:
+    aesgcm = AESGCM(otp_secret)
+    iv = os.urandom(12)  # 96-bit IV
+    
+    ciphertext = aesgcm.encrypt(iv, recovery_key, None)
+    
+    return {
+        'wrapped_recovery_key': ciphertext,
+        'layer2_iv': iv
+    }
+```
 
 ```javascript
 // Web/Node.js - Using Web Crypto API
